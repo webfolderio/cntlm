@@ -24,12 +24,12 @@
 #include <unistd.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 
 #include "proxy.h"
 #include "globals.h"
 #include "socket.h"
 #include "http.h"
-#include "ntlm.h"
 #include "pac.h"
 
 #if config_gss == 1
@@ -87,9 +87,91 @@ proxylist_t parent_list = NULL;
 unsigned long parent_curr = 0;
 pthread_mutex_t parent_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-#if config_gss == 1
 proxy_t *curr_proxy;
-#endif
+
+#define KERBEROS_AUTH_BACKOFF_SECONDS 30
+
+typedef enum {
+	KRB_AUTH_NO_TOKEN,
+	KRB_AUTH_UPSTREAM_407,
+	KRB_AUTH_NO_NEGOTIATE,
+	KRB_AUTH_BACKOFF
+} krb_auth_failure_t;
+
+static pthread_mutex_t krb_auth_mtx = PTHREAD_MUTEX_INITIALIZER;
+static time_t krb_auth_backoff_until = 0;
+static time_t krb_auth_last_log = 0;
+static krb_auth_failure_t krb_auth_last_reason = KRB_AUTH_NO_TOKEN;
+static char krb_auth_last_proxy[MINIBUF_SIZE] = "";
+
+static const char *krb_auth_failure_msg(krb_auth_failure_t reason) {
+	switch (reason) {
+		case KRB_AUTH_NO_TOKEN:
+			return "Kerberos token acquisition failed";
+		case KRB_AUTH_UPSTREAM_407:
+			return "parent proxy rejected Kerberos authentication";
+		case KRB_AUTH_NO_NEGOTIATE:
+			return "parent proxy did not offer Negotiate authentication";
+		case KRB_AUTH_BACKOFF:
+			return "Kerberos authentication backoff active";
+	}
+	return "Kerberos authentication failed";
+}
+
+static void krb_auth_log_failure(const char *proxy, krb_auth_failure_t reason, int start_backoff) {
+	time_t now = time(NULL);
+	int should_log;
+
+	if (proxy == NULL)
+		proxy = "unknown";
+
+	pthread_mutex_lock(&krb_auth_mtx);
+	/*
+	 * A failed Kerberos exchange can otherwise be repeated by many client
+	 * requests in parallel. Backoff keeps cntlm from hammering Fortinet/KDC
+	 * while still returning a deterministic local 502 to clients.
+	 */
+	if (start_backoff)
+		krb_auth_backoff_until = now + KERBEROS_AUTH_BACKOFF_SECONDS;
+
+	should_log = krb_auth_last_log == 0
+		|| now - krb_auth_last_log >= KERBEROS_AUTH_BACKOFF_SECONDS
+		|| krb_auth_last_reason != reason
+		|| strncmp(krb_auth_last_proxy, proxy, sizeof(krb_auth_last_proxy)) != 0;
+
+	if (should_log) {
+		krb_auth_last_log = now;
+		krb_auth_last_reason = reason;
+		strlcpy(krb_auth_last_proxy, proxy, sizeof(krb_auth_last_proxy));
+	}
+	pthread_mutex_unlock(&krb_auth_mtx);
+
+	if (should_log)
+		syslog(LOG_ERR, "Kerberos-only proxy authentication failed for %s: %s\n",
+			proxy, krb_auth_failure_msg(reason));
+
+	if (debug)
+		printf("Kerberos-only mode: %s for %s%s\n", krb_auth_failure_msg(reason), proxy,
+			start_backoff ? " (starting backoff)" : "");
+}
+
+static int krb_auth_backoff_active(const char *proxy) {
+	time_t now = time(NULL);
+	time_t until;
+
+	pthread_mutex_lock(&krb_auth_mtx);
+	until = krb_auth_backoff_until;
+	pthread_mutex_unlock(&krb_auth_mtx);
+
+	if (until > now) {
+		if (debug)
+			printf("Kerberos-only mode: backoff active for %ld more seconds\n", (long)(until - now));
+		krb_auth_log_failure(proxy, KRB_AUTH_BACKOFF, 0);
+		return 1;
+	}
+
+	return 0;
+}
 
 /*
  * Add a new item to a list. Every proxylist_t variable must be
@@ -477,11 +559,9 @@ int proxy_connect(struct auth_s *credentials, const char* url, const char* hostn
 				proxy = p->proxy;
 				syslog(LOG_ERR, "Proxy connect failed, will try %s:%d\n", proxy->hostname, proxy->port);
 			}
-#if config_gss == 1
 		} else {
 			//kerberos needs the hostname of the parent proxy for generate the token, so we keep it
 			curr_proxy = proxy;
-#endif
 		}
 	} while (i < 0 && ++loop < proxycount);
 
@@ -532,39 +612,41 @@ int proxy_connect(struct auth_s *credentials, const char* url, const char* hostn
 int proxy_authenticate(int *sd, rr_data_t request, rr_data_t response, struct auth_s *credentials) {
 	char *tmp;
 	char *buf;
-	char *challenge;
-	rr_data_t auth;
-	int len;
+	rr_data_t auth = NULL;
 
 	int pretend407 = 0;
 	int rc = 0;
+	const char *proxy_host = curr_proxy ? curr_proxy->hostname : NULL;
 	size_t bufsize = BUFSIZE;
 	buf = zmalloc(bufsize);
 
-#if config_gss == 1
-	if(g_creds->haskrb && acquire_kerberos_token(curr_proxy->hostname, credentials, &buf, &bufsize)) {
-		//pre auth, we try to authenticate directly with kerberos, without to ask if auth is needed
-		//we assume that if kdc releases a ticket for the proxy, then the proxy is configured for kerberos auth
-		//drawback is that later in the code cntlm logs that no auth is required because we have already authenticated
-		if (debug)
-			printf("Using Negotiation ...\n");
+	if (krb_auth_backoff_active(proxy_host)) {
+		if (response)
+			response->errmsg = "Parent proxy authentication failed";
+		goto bailout;
 	}
-	else {
-#endif
-
-		strlcpy(buf, "NTLM ", bufsize);
-		len = ntlm_request(&tmp, credentials);
-		if (len) {
-			to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, bufsize-5);
-			free(tmp);
-		}
 
 #if config_gss == 1
+	/*
+	 * Strict Kerberos-only boundary: if no Negotiate token can be built from
+	 * the existing cache, stop here. Do not probe Fortinet with NTLM or an
+	 * empty Proxy-Authorization header.
+	 */
+	if(!proxy_host || !g_creds->haskrb || !acquire_kerberos_token(proxy_host, credentials, &buf, &bufsize)) {
+		krb_auth_log_failure(proxy_host, KRB_AUTH_NO_TOKEN, 1);
+		if (response)
+			response->errmsg = "Parent proxy authentication failed";
+		goto bailout;
 	}
+#else
+	krb_auth_log_failure(proxy_host, KRB_AUTH_NO_TOKEN, 1);
+	if (response)
+		response->errmsg = "Parent proxy authentication failed";
+	goto bailout;
 #endif
 
+	request->headers = hlist_mod(request->headers, "Proxy-Authorization", buf, 1);
 	auth = dup_rr_data(request);
-	auth->headers = hlist_mod(auth->headers, "Proxy-Authorization", buf, 1);
 
 	if (HEAD(request) || http_has_body(request, response) != 0) {
 		/*
@@ -603,7 +685,7 @@ int proxy_authenticate(int *sd, rr_data_t request, rr_data_t response, struct au
 	if (debug) {
 		printf("\nSending PROXY auth request...\n");
 		printf("HEAD: %s %s %s\n", auth->method, auth->url, auth->http);
-		hlist_dump(auth->headers);
+		printf("Kerberos-only mode: sending redacted Proxy-Authorization Negotiate header\n");
 	}
 
 	if (!headers_send(*sd, auth)) {
@@ -646,46 +728,19 @@ int proxy_authenticate(int *sd, rr_data_t request, rr_data_t response, struct au
 		tmp = hlist_get(auth->headers, "Proxy-Authenticate");
 
 		if (tmp) {
-#if config_gss == 1
-			if(g_creds->haskrb && strncasecmp(tmp, "NEGOTIATE", 9) == 0 && acquire_kerberos_token(curr_proxy->hostname, credentials, &buf, &bufsize)) {
-				if (debug)
-					printf("Using Negotiation ...\n");
-
-				request->headers = hlist_mod(request->headers, "Proxy-Authorization", buf, 1);
-			}
-			else {
-#endif
-				challenge = zmalloc(strlen(tmp) + 5 + 1);
-				len = from_base64(challenge, tmp + 5);
-				if (len > NTLM_CHALLENGE_MIN) {
-					tmp = NULL;
-					len = ntlm_response(&tmp, challenge, len, credentials);
-					if (len > 0) {
-						strlcpy(buf, "NTLM ", bufsize);
-						to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, bufsize-5);
-						request->headers = hlist_mod(request->headers, "Proxy-Authorization", buf, 1);
-						free(tmp);
-					} else {
-						syslog(LOG_ERR, "No target info block. Cannot do NTLMv2!\n");
-						free(challenge);
-						free(tmp);
-						close(*sd);
-						goto bailout;
-					}
-				} else {
-					syslog(LOG_ERR, "Proxy returning invalid challenge!\n");
-					free(challenge);
-					close(*sd);
-					goto bailout;
-				}
-
-				free(challenge);
-#if config_gss == 1
-			}
-#endif
+			if (hlist_subcmp_all(auth->headers, "Proxy-Authenticate", "NEGOTIATE"))
+				krb_auth_log_failure(proxy_host, KRB_AUTH_UPSTREAM_407, 1);
+			else
+				krb_auth_log_failure(proxy_host, KRB_AUTH_NO_NEGOTIATE, 1);
 		} else {
-			syslog(LOG_WARNING, "No Proxy-Authenticate, NTLM/Negotiate not supported?\n");
+			krb_auth_log_failure(proxy_host, KRB_AUTH_NO_NEGOTIATE, 1);
 		}
+
+		if (response)
+			response->errmsg = "Parent proxy authentication failed";
+		rc = 0;
+		close(*sd);
+		goto bailout;
 	} else if (pretend407) {
 		if (debug)
 			printf("Client %s - forcing second request.\n", HEAD(request) ? "sent HEAD" : "has a body");

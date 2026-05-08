@@ -266,17 +266,29 @@ int acquire_kerberos_token(const char* hostname, struct auth_s *credentials,
 	if (!(credentials->haskrb & KRB_CREDENTIAL_AVAILABLE)) {
 		credentials->haskrb |= check_credential();
 		if (!(credentials->haskrb & KRB_CREDENTIAL_AVAILABLE)){
-			//no credential -> no token
+			/*
+			 * Use only an existing credential cache. We never prompt for a
+			 * password or run kinit from cntlm; without a TGT this request
+			 * fails locally before contacting the parent proxy.
+			 */
 			if (debug)
 				printf("No valid credential available\n");
 			return 0;
 		}
 	}
 
-	gss_buffer_desc send_tok;
+	gss_buffer_desc send_tok = {0, NULL};
 
 	strlcpy(service_name, "HTTP@", BUFSIZE);
 	strlcat(service_name, hostname, BUFSIZE);
+
+	/*
+	 * gss_init_sec_context may obtain an HTTP/<proxy> service ticket from
+	 * the existing TGT. That is expected Kerberos client behavior and is
+	 * not a password login or TGT creation.
+	 */
+	if (debug)
+		printf("Kerberos-only mode: requesting service ticket for %s\n", service_name);
 
 	int rc = client_establish_context(service_name, &ret_flags, &send_tok);
 
@@ -301,7 +313,8 @@ int acquire_kerberos_token(const char* hostname, struct auth_s *credentials,
 		to_base64((unsigned char *)token, send_tok.value, send_tok.length, token_size);
 
 		if (debug) {
-			printf("Token B64 (%d size=%d)... %s\n", (int)token_size, (int)strlen(token), token);
+			printf("Kerberos-only mode: acquired Negotiate token for %s (token redacted, size=%d)\n",
+				service_name, (int)send_tok.length);
 			display_ctx_flags(ret_flags);
 		}
 
@@ -315,7 +328,8 @@ int acquire_kerberos_token(const char* hostname, struct auth_s *credentials,
 		rc=0;
 	}
 
-	(void) gss_release_buffer(&min_stat, &send_tok);
+	if (send_tok.value)
+		(void) gss_release_buffer(&min_stat, &send_tok);
 
 	return rc;
 }
@@ -342,8 +356,18 @@ int check_credential(void) {
 	(void) gss_release_oid_set(&min_stat, &mechanisms);
 
 	if (name != NULL) {
+		if (lifetime <= KRB_MIN_LIFETIME_SECONDS) {
+			if (debug) {
+				printf("Kerberos-only mode: cached credential lifetime too low (%u seconds)\n",
+					(unsigned int)lifetime);
+			}
+			(void) gss_release_name(&min_stat, &name);
+			return 0;
+		}
 		if (debug) {
 			display_name("Available cached credential", &name);
+			printf("Kerberos-only mode: cached credential lifetime %u seconds\n",
+				(unsigned int)lifetime);
 		}
 		(void) gss_release_name(&min_stat, &name);
 		return KRB_CREDENTIAL_AVAILABLE;

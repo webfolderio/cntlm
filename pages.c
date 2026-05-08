@@ -74,6 +74,7 @@ char *gen_502_page(const char *http, const char *msg) {
 	tmp = zmalloc(BUFSIZE);
 	snprintf(tmp, BUFSIZE-1,
 		"%s 502 %s\r\n"
+		"Connection: close\r\n"
 		"Content-Type: text/html\r\n\r\n"
 		"<html><body><h1>502 %s</h1><p><a href='http://cntlm.sf.net/'>Cntlm</a> proxy failed to complete the request.</p></body></html>",
 		http, msg, msg);

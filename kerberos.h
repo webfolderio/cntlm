@@ -39,6 +39,8 @@
 #define KRB_OK 			1
 #define KRB_KO 			4
 
+#define KRB_MIN_LIFETIME_SECONDS 60
+
 /**
  * acquires a kerberos token for default credential using SPN HTTP@<thost>
  */

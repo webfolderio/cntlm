@@ -31,7 +31,6 @@
 #include "auth.h"
 #include "http.h"
 #include "socket.h"
-#include "ntlm.h"
 #include "pages.h"
 
 int host_connect(const char *hostname, int port) {
@@ -49,136 +48,19 @@ int host_connect(const char *hostname, int port) {
 }
 
 int www_authenticate(int sd, int cd, rr_data_t request, rr_data_t response, struct auth_s *creds, int probe) {
-	char *tmp;
-	char *buf;
-	char *challenge;
-	rr_data_t auth;
-	int len;
+	(void)sd;
+	(void)cd;
+	(void)request;
+	(void)creds;
+	(void)probe;
 
-	int rc = 0;
-
-	buf = zmalloc(BUFSIZE);
-
-	strlcpy(buf, "NTLM ", BUFSIZE);
-	len = ntlm_request(&tmp, creds);
-	if (len) {
-		to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, BUFSIZE-5);
-		free(tmp);
-	}
-
-	auth = dup_rr_data(request);
-	auth->headers = hlist_mod(auth->headers, "Connection", "keep-alive", 1);
-	auth->headers = hlist_mod(auth->headers, "Authorization", buf, 1);
-	auth->headers = hlist_mod(auth->headers, "Content-Length", "0", 1);
-	auth->headers = hlist_del(auth->headers, "Transfer-Encoding");
-
-	/*
-	 * Drop whatever error page server returned, only if we didn't send a HEAD request (probe)
-	 * In this case the response can contain a Content-Length > 0 but anyway there is no body.
-	 */
-	if (!probe && !http_body_drop(sd, response))
-		goto bailout;
-
-	if (debug) {
-		printf("\nSending WWW auth request...\n");
-		hlist_dump(auth->headers);
-	}
-
-	if (!headers_send(sd, auth))
-		goto bailout;
-
+	syslog(LOG_ERR, "WWW NTLM authentication is unsupported in Kerberos-only mode\n");
 	if (debug)
-		printf("\nReading WWW auth response...\n");
+		printf("Kerberos-only mode: refusing WWW NTLM authentication\n");
+	if (response)
+		response->errmsg = "WWW authentication unsupported";
 
-	/*
-	 * Get NTLM challenge
-	 */
-	reset_rr_data(auth);
-	if (!headers_recv(sd, auth)) {
-		goto bailout;
-	}
-
-	if (debug)
-		hlist_dump(auth->headers);
-
-	/*
-	 * Auth required?
-	 */
-	if (auth->code == 401) {
-		if (!http_body_drop(sd, auth))
-			goto bailout;
-
-		tmp = hlist_get(auth->headers, "WWW-Authenticate");
-		if (tmp && strlen(tmp) > 6 + 8) {
-			challenge = zmalloc(strlen(tmp) + 5 + 1);
-			len = from_base64(challenge, tmp + 5);
-			if (len > NTLM_CHALLENGE_MIN) {
-				tmp = NULL;
-				len = ntlm_response(&tmp, challenge, len, creds);
-				if (len > 0) {
-					strlcpy(buf, "NTLM ", BUFSIZE);
-					to_base64(MEM(buf, uint8_t, 5), MEM(tmp, uint8_t, 0), len, BUFSIZE-5);
-					request->headers = hlist_mod(request->headers, "Authorization", buf, 1);
-					free(tmp);
-				} else {
-					syslog(LOG_ERR, "No target info block. Cannot do NTLMv2!\n");
-					response->errmsg = "Invalid NTLM challenge from web server";
-					free(challenge);
-					free(tmp);
-					goto bailout;
-				}
-			} else {
-				syslog(LOG_ERR, "Server returning invalid challenge!\n");
-				response->errmsg = "Invalid NTLM challenge from web server";
-				free(challenge);
-				goto bailout;
-			}
-
-			free(challenge);
-		} else {
-			syslog(LOG_WARNING, "No challenge in WWW-Authenticate!\n");
-			response->errmsg = "Web server reply missing NTLM challenge";
-			goto bailout;
-		}
-	} else {
-		goto bailout;
-	}
-
-	if (debug)
-		printf("\nSending WWW auth...\n");
-
-	if (!headers_send(sd, request)) {
-		goto bailout;
-	}
-
-	/*
-	 * If we sent a HEAD request (probe) this is the moment to send the body of
-	 * the original request (we just sent headers with authorization)
-	 */
-	reset_rr_data(auth);
-	if (probe && !http_body_send(sd, cd, request, auth)) {
-		goto bailout;
-	}
-
-	if (debug)
-		printf("\nReading final server response...\n");
-
-	if (!headers_recv(sd, auth)) {
-		goto bailout;
-	}
-
-	rc = 1;
-
-	if (debug)
-		hlist_dump(auth->headers);
-
-bailout:
-	if (rc)
-		copy_rr_data(response, auth);
-	free_rr_data(&auth);
-	free(buf);
-
-	return rc;
+	return 0;
 }
 
 rr_data_t direct_request(void *cdata, rr_data_const_t request) {

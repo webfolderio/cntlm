@@ -291,6 +291,11 @@ beginning:
 				if (!proxy_authenticate(wsocket[0], data[0], data[1], tcreds)) {
 					if (debug)
 						printf("Proxy auth connection error.\n");
+					if (data[1]->errmsg) {
+						tmp = gen_502_page(data[0]->http, "Parent proxy authentication failed");
+						(void) write_wrapper(cd, tmp, strlen(tmp));
+						free(tmp);
+					}
 					free_rr_data(&data[0]);
 					free_rr_data(&data[1]);
 					rc = (void *)-1;
@@ -313,9 +318,16 @@ beginning:
 				 */
 				if (data[1]->code != 407) {		// || !hlist_subcmp(data[1]->headers, "Proxy-Connection", "keep-alive")) {
 					if (debug)
-						printf("Proxy auth not requested - just forwarding.\n");
+						printf("Kerberos proxy auth accepted - just forwarding.\n");
+					/*
+					 * Preemptive Kerberos auth can return the real upstream
+					 * response immediately. Treat that connection as
+					 * authenticated so keep-alive reuse avoids unnecessary
+					 * gss_init_sec_context calls; this also reduces exposure
+					 * to Apple's small per-token GSS/Heimdal leak.
+					 */
 					if (data[1]->code < 400)
-						noauth = 1;
+						authok = 1;
 					loop = 1;
 				} else {
 					/*
@@ -395,7 +407,10 @@ beginning:
 					printf("Sending headers (%d)...\n", *wsocket[loop]);
 					if (loop == 0) {
 						printf("HEAD: %s %s %s\n", data[loop]->method, data[loop]->url, data[loop]->http);
-						hlist_dump(data[loop]->headers);
+						if (hlist_get(data[loop]->headers, "Proxy-Authorization"))
+							printf("Kerberos-only mode: request headers contain redacted Proxy-Authorization\n");
+						else
+							hlist_dump(data[loop]->headers);
 					}
 				}
 

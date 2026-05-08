@@ -910,17 +910,9 @@ int main(int argc, char **argv) {
 				strlcpy(cworkstation, optarg, MINIBUF_SIZE);
 				break;
 			case 'X':
-#ifdef __CYGWIN__
-				if (!sspi_set(optarg))
-				{
-					fprintf(stderr, "SSPI initialize failed (%s)! Proceeding with SSPI disabled.\n", optarg);
-				} else {
-					syslog(LOG_INFO, "SSPI %s mode enabled!", optarg);
-				}
-#else
-				fprintf(stderr, "This feature is available under Windows only!\n");
-				help = 1;
-#endif
+				(void)optarg;
+				syslog(LOG_ERR, "SSPI authentication is unsupported in Kerberos-only mode\n");
+				myexit(1);
 				break;
 			case 'q':
 				syslog_debug = 1;
@@ -937,7 +929,7 @@ int main(int argc, char **argv) {
 	 * Help requested?
 	 */
 	if (help > 0) {
-		printf("CNTLM - Accelerating NTLM Authentication Proxy version " VERSION "\n");
+		printf("CNTLM - Kerberos-only Authentication Proxy version " VERSION "\n");
 		printf("Copyright (c) 2oo7-2o1o David Kubicek\n\n"
 			"This program comes with NO WARRANTY, to the extent permitted by law. You\n"
 			"may redistribute copies of it under the terms of the GNU GPL Version 2 or\n"
@@ -954,17 +946,9 @@ int main(int argc, char **argv) {
 		fprintf(stream, "Usage: %s [-AaBcDdFfGgHhILlMNOPpqRrSsTUuvwXx] <proxy_host>[:]<proxy_port> ...\n", argv[0]);
 		fprintf(stream, "\t-A  <address>[/<net>]\n"
 				"\t    ACL allow rule. IP or hostname, net must be a number (CIDR notation)\n");
-		fprintf(stream, "\t-a  ntlm | nt | lm"
-#if config_gss == 1
-				" | gss\n"
-				"\t    Authentication type - combined NTLM, just LM, just NT, or GSS. Default NTLM.\n"
-				"\t    GSS activates kerberos auth: you need a cached credential.\n"
-#else
-				"\n"
-				"\t    Authentication type - combined NTLM, just LM, or just NT. Default NTLM.\n"
-#endif
-				"\t    NTLM is the most versatile setting and likely to work for you.\n");
-		fprintf(stream, "\t-B  Enable NTLM-to-basic authentication.\n");
+		fprintf(stream, "\t-a  gss\n"
+				"\t    Authentication type. This fork supports only Kerberos/GSS with an existing cached credential.\n");
+		fprintf(stream, "\t-B  Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\t-c  <config_file>\n"
 				"\t    Configuration file. Other arguments can be used as well, overriding\n"
 				"\t    config file settings.\n");
@@ -973,22 +957,22 @@ int main(int argc, char **argv) {
 		fprintf(stream, "\t-d  <domain>\n"
 				"\t    Domain/workgroup can be set separately.\n");
 		fprintf(stream, "\t-F  <flags>\n"
-				"\t    NTLM authentication flags.\n");
+				"\t    Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\t-f  Run in foreground, do not fork into daemon mode.\n");
 		fprintf(stream, "\t-G  <pattern>\n"
 				"\t    User-Agent matching for the trans-isa-scan plugin.\n");
 		fprintf(stream, "\t-g  Gateway mode - listen on all interfaces, not only loopback.\n");
-		fprintf(stream, "\t-H  Print password hashes for use in config file (NTLMv2 needs -u and -d).\n");
+		fprintf(stream, "\t-H  Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\t-h  Print this help info along with version number.\n");
-		fprintf(stream, "\t-I  Prompt for the password interactively.\n");
+		fprintf(stream, "\t-I  Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\t-L  [<saddr>:]<lport>:<rhost>:<rport>\n"
 				"\t    Forwarding/tunneling a la OpenSSH. Same syntax - listen on lport\n"
 				"\t    and forward all connections through the proxy to rhost:rport.\n"
 				"\t    Can be used for direct tunneling without corkscrew, etc.\n");
 		fprintf(stream, "\t-l  [<saddr>:]<lport>\n"
-				"\t    Main listening port for the NTLM proxy.\n");
+				"\t    Main listening port for the Kerberos proxy.\n");
 		fprintf(stream, "\t-M  <testurl>\n"
-				"\t    Magic autodetection of proxy's NTLM dialect.\n");
+				"\t    Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\t-N  \"<hostname_wildcard1>[, <hostname_wildcardN>\"\n"
 				"\t    List of URL's to serve directly as stand-alone proxy (e.g. '*.local')\n");
 		fprintf(stream, "\t-O  [<saddr>:]<lport>\n"
@@ -996,7 +980,7 @@ int main(int argc, char **argv) {
 		fprintf(stream, "\t-P  <pidfile>\n"
 				"\t    Create a PID file upon successful start.\n");
 		fprintf(stream, "\t-p  <password>\n"
-				"\t    Account password. Will not be visible in \"ps\", /proc, etc.\n");
+				"\t    Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\t-q  Sets the Syslog logging level to DEBUG (default level is INFO).\n");
 		fprintf(stream, "\t-R  <username>:<password>\n"
 				"\t    Enable authorization for SOCKS5 proxy, when enabled.\n"
@@ -1020,8 +1004,7 @@ int main(int argc, char **argv) {
 		fprintf(stream, "\t-x  <PAC_file>\n"
 				"\t    Specify a PAC file to load.\n");
 		fprintf(stream, "\t-X  <sspi_handle_type>\n"
-				"\t    Use SSPI with specified handle type. Works only under Windows.\n"
-				"\t    Default is negotiate.\n");
+				"\t    Unsupported in Kerberos-only mode.\n");
 		fprintf(stream, "\n");
 		exit(exit_code);
 	}
@@ -1228,12 +1211,9 @@ int main(int argc, char **argv) {
 		tmp = zmalloc(MINIBUF_SIZE);
 		CFG_DEFAULT(cf, "SSPI", tmp, MINIBUF_SIZE)
 
-		if (!sspi_enabled() && strlen(tmp)) {
-			if (!sspi_set(tmp)) { // Only NTLM supported for now
-				fprintf(stderr, "SSPI initialize failed (%s)! Proceeding with SSPI disabled.\n", tmp);
-			} else {
-				syslog(LOG_INFO, "SSPI %s mode enabled!", tmp);
-			}
+		if (strlen(tmp)) {
+			syslog(LOG_ERR, "SSPI authentication is unsupported in Kerberos-only mode\n");
+			myexit(1);
 		}
 		free(tmp);
 
@@ -1299,6 +1279,32 @@ int main(int argc, char **argv) {
 
 	config_close(cf);
 
+	if (ntlmbasic) {
+		syslog(LOG_ERR, "NTLMToBasic is unsupported in Kerberos-only mode.\n");
+		myexit(1);
+	}
+	if (interactivehash || interactivepwd || magic_detect) {
+		syslog(LOG_ERR, "Password prompts, hash generation, and magic auth detection are unsupported in Kerberos-only mode.\n");
+		myexit(1);
+	}
+	if (cflags) {
+		syslog(LOG_ERR, "Manual NTLM flags are unsupported in Kerberos-only mode.\n");
+		myexit(1);
+	}
+	if (strlen(cpassword) || strlen(cpassntlm2) || strlen(cpassnt) || strlen(cpasslm)) {
+		syslog(LOG_ERR, "Password and NTLM hash options are unsupported in Kerberos-only mode.\n");
+		myexit(1);
+	}
+	/*
+	 * Kerberos-only mode is deliberately fail-closed. Password and hash
+	 * options are rejected before any proxy/PAC setup so this process cannot
+	 * ever manufacture NTLM credentials or prompt for an AD password.
+	 */
+	if (strlen(cauth) && strcasecmp("gss", cauth)) {
+		syslog(LOG_ERR, "Unsupported authentication type '%s'. Kerberos-only mode requires Auth GSS.\n", cauth);
+		myexit(1);
+	}
+
 	/* Start Pac engine if pac_file available */
 	/* TODO: pac file option in config file */
 	if (pac) {
@@ -1339,46 +1345,25 @@ int main(int argc, char **argv) {
 	}
 
 	/*
-	 * Parse selected NTLM hash combination.
+	 * This fork supports only Kerberos/GSS parent proxy authentication.
 	 */
 	assert(g_creds);
 	if (strlen(cauth)) {
-		if (!strcasecmp("ntlm", cauth)) {
-			g_creds->hashnt = 1;
-			g_creds->hashlm = 1;
-		} else if (!strcasecmp("nt", cauth)) {
-			g_creds->hashnt = 1;
-		} else if (!strcasecmp("lm", cauth)) {
-			g_creds->hashlm = 1;
-		} else if (!strcasecmp("ntlmv2", cauth)) {
-			g_creds->hashntlm2 = 1;
-		} else if (!strcasecmp("ntlm2sr", cauth)) {
-			g_creds->hashnt = 2;
-#if config_gss == 1
-		} else if (!strcasecmp("gss", cauth)) {
-			g_creds->haskrb = KRB_FORCE_USE_KRB;
-			syslog(LOG_INFO, "Forcing GSS auth.\n");
-#endif
-		} else {
-			syslog(LOG_ERR, "Unknown NTLM auth combination.\n");
+		if (strcasecmp("gss", cauth)) {
+			syslog(LOG_ERR, "Unsupported authentication type '%s'. Kerberos-only mode requires Auth GSS.\n", cauth);
 			myexit(1);
 		}
-	} else {
-		// default "ntlmv2"
-		g_creds->hashntlm2 = 1;
 	}
+#if config_gss == 1
+	g_creds->haskrb = KRB_FORCE_USE_KRB;
+	syslog(LOG_INFO, "Kerberos-only mode enabled (Auth GSS).\n");
+#else
+	syslog(LOG_ERR, "Kerberos-only mode requires GSS support at build time.\n");
+	myexit(1);
+#endif
 
 	if (socksd_list && !users_list)
 		syslog(LOG_WARNING, "SOCKS5 proxy will NOT require any authentication\n");
-
-	if (!magic_detect)
-		syslog(LOG_INFO, "Using following NTLM hashes: NTLMv2(%d) NT(%d) LM(%d)\n",
-			g_creds->hashntlm2, g_creds->hashnt, g_creds->hashlm);
-
-	if (cflags) {
-		syslog(LOG_INFO, "Using manual NTLM flags: 0x%X\n", swap32(cflags));
-		g_creds->flags = cflags;
-	}
 
 	/*
 	 * Last chance to get password from the user

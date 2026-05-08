@@ -9,6 +9,11 @@
 ] [ \fIhost1\fP \fIport1\fP | \fIhost1\fP:\fIport1\fP ] ... \fIhostN\fP \fIportN\fP
 
 .SH DESCRIPTION
+\fBKerberos-only fork:\fP this build supports only \fBAuth GSS\fP for parent proxy
+authentication. It uses an existing Kerberos credential cache, never prompts for
+a password, never creates tickets, and never falls back to NTLM. Password, hash,
+SSPI, NTLMToBasic, Flags, and magic NTLM detection options are unsupported.
+
 \fBCntlm\fP is an NTLM/NTLM SR/NTLMv2 authenticating HTTP proxy. It stands between your applications and the
 corporate proxy, adding NTLM authentication on-the-fly. You can specify several "parent" proxies and Cntlm
 will try one after another until one works. All auth'd connections are cached and reused to achieve high
